@@ -17,7 +17,7 @@ Screenshots: screenshot1.png, screenshot2.png, screenshot3.png
 Gems and sockets: ores drop gems (citrine, iriscite, jade, ruby, sapphire in six tiers, and vacucite), items get 1-3 sockets, gems go in on the anvil and give their bonuses; tree skills about gems now work, healing on hit too. Tree attribute bonuses now reach players on a dedicated server. Gem items: the content mod kotost_gems.
 
 ## Summary
-A big passive skill tree with gems and sockets: buy points with experience, learn 588 skills, socket gems from ores into your gear. A port of Passive Skill Tree by Daripher.
+A big passive skill tree: learn 588 skills for experience, socket gems from ores into your gear. A port of Passive Skill Tree by Daripher.
 
 ## Description
 Press **O** (or `/skilltree`) to open the tree: 588 skills on one starry map, linked into branches for warriors, archers, miners, cooks, mages and travellers, with big keystones. The button at the bottom buys a skill point for experience (every next point costs more); take up to three of the six starting skills, then click a skill that touches one you already have to learn it. Mouse wheel zooms, drag moves, hover a skill to read its bonuses.
