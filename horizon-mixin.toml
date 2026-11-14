@@ -4,7 +4,7 @@
 # Native mod for Horizon nightly-2026-11-08-fdc87ae (docs/native-mods.md, horizon-mixins).
 [mod]
 id = "kotost_skilltree"
-version = "0.1.0"
+version = "0.2.0"
 priority = 100
 
 [compatibility]
@@ -190,4 +190,57 @@ bindings = [
   { name = "screen", ty = "&NativeScreenView<'_>", value = "screen" },
   { name = "key", ty = "&str", value = "key" },
   { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
+
+# --- gems (0.2.0) ------------------------------------------------------------------------------------
+# A gem now and then from an ore a player broke without Silk Touch.
+[[injection]]
+id = "loot-drops"
+kind = "HEAD"
+hook = "loot_drops"
+hook_version = 1
+helper = "hooks/loot_drops.rs"
+bindings = [
+  { name = "context", ty = "&horizon_client::mod_api::NativeLootDrops<'_>", value = "context" },
+  { name = "drops", ty = "&mut Vec<horizon_client::items::ItemStack>", value = "&mut *drops" },
+]
+
+# A gem's bonuses, an item's sockets and gems, in its tooltip.
+[[injection]]
+id = "tooltip"
+kind = "HEAD"
+hook = "tooltip"
+hook_version = 1
+helper = "hooks/tooltip.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "self" },
+  { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
+  { name = "lines", ty = "&mut Vec<(horizon_client::text::Text, u32)>", value = "&mut *lines" },
+]
+
+# An item and a gem on an anvil: the gem goes into a socket (the catalog of this revision lacks the name).
+[[injection]]
+id = "anvil"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_anvil_update"
+helper = "hooks/anvil.rs"
+bindings = [
+  { name = "player", ty = "u128", value = "player" },
+  { name = "left", ty = "&horizon_client::items::ItemStack", value = "left" },
+  { name = "right", ty = "Option<&horizon_client::items::ItemStack>", value = "right" },
+  { name = "output", ty = "&mut Option<horizon_client::items::ItemStack>", value = "&mut *output" },
+  { name = "xp_cost", ty = "&mut i32", value = "&mut *xp_cost" },
+  { name = "material_cost", ty = "&mut i32", value = "&mut *material_cost" },
+]
+
+# The server's work (points, skills, attribute modifiers, gems) at the end of each server tick.
+[[injection]]
+id = "server-tick"
+kind = "HEAD"
+hook = "server_tick"
+hook_version = 1
+helper = "hooks/server_tick.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "phase", ty = "horizon_client::mod_api::ServerTickPhase", value = "phase" },
 ]

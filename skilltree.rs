@@ -4,10 +4,15 @@
 // Server: the points (bought with experience), the learned skills, their bonuses, the save file.
 // Client: the tree's screen (O, or /skilltree).
 // Bonuses this version runs: vanilla attributes, damage, critical hits, evasion, blocking, block
-// break speed, jump height, experience per minute. The others show grey in the tooltips.
+// break speed, jump height, experience per minute, healing on a hit, gems. The others show grey.
+// Gems (0.2.0): the items are the content mod `kotost_gems`; here they drop from ores, go into
+// sockets on an anvil (an item with a gem on the right) and give their bonus while worn or held.
 use super::Game;
 use horizon_client::hud::HudBatch;
-use horizon_client::mod_api::{EquipmentSlot, NativeCommand, NativeScreenView, NativeServerPlayer};
+use horizon_client::items::ItemStack;
+use horizon_client::mod_api::{
+    EquipmentSlot, NativeCommand, NativeLootDrops, NativeScreenView, NativeServerPlayer, ServerTickPhase,
+};
 use horizon_client::text::Text;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -40,6 +45,8 @@ enum Cond {
     Hand(String),
     Equip(String),
     Hp(f64, f64),
+    /// Gems in the worn or held items of a type: at least, at most (-1: no bound).
+    Gems(String, f64, f64),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -51,6 +58,14 @@ enum Kind {
     Evasion,
     Blocking,
     XpPerMinute,
+    /// Healing on a melee hit.
+    Heal,
+    /// A chance (`v`) for `x` more gems from an ore.
+    GemLoot,
+    /// Gems put into items of type `e` are stronger by `v` (read at the anvil).
+    GemPower,
+    /// `v` more sockets in items of type `e` (read at the anvil).
+    Sockets,
 }
 
 struct Fx {
@@ -60,6 +75,54 @@ struct Fx {
     attr: String,
     dc: Dc,
     cond: Cond,
+    x: f64,
+    e: String,
+    /// "For each gem in items of this type": the value is multiplied by that count.
+    per_gem: Option<String>,
+}
+
+fn parse_fx(v: &serde_json::Value) -> Option<Fx> {
+    let f = |v: &serde_json::Value| v.as_f64().unwrap_or(0.0);
+    let c = &v["c"];
+    let e = || c["e"].as_str().unwrap_or("any").to_owned();
+    let cond = match c["k"].as_str() {
+        Some("hand") => Cond::Hand(e()),
+        Some("equip") => Cond::Equip(e()),
+        Some("hp") => Cond::Hp(f(&c["min"]), f(&c["max"])),
+        Some("gems") => Cond::Gems(e(), f(&c["min"]), f(&c["max"])),
+        _ => Cond::None,
+    };
+    let kind = match v["t"].as_str()? {
+        "attr" => Kind::Attr,
+        "dmg" => Kind::Dmg,
+        "crit" => Kind::Crit,
+        "critdmg" => Kind::CritDmg,
+        "evasion" => Kind::Evasion,
+        "blocking" => Kind::Blocking,
+        "exp_per_minute" => Kind::XpPerMinute,
+        "heal" => Kind::Heal,
+        "gemloot" => Kind::GemLoot,
+        "gempower" => Kind::GemPower,
+        "sockets" => Kind::Sockets,
+        _ => return None,
+    };
+    let dc = match v["dc"].as_str() {
+        Some("melee") => Dc::Melee,
+        Some("projectile") => Dc::Projectile,
+        Some("magic") => Dc::Magic,
+        _ => Dc::Any,
+    };
+    Some(Fx {
+        kind,
+        v: f(&v["v"]),
+        op: v["op"].as_u64().unwrap_or(0) as u8,
+        attr: v["a"].as_str().unwrap_or("").to_owned(),
+        dc,
+        cond,
+        x: f(&v["x"]),
+        e: v["e"].as_str().unwrap_or("any").to_owned(),
+        per_gem: v["m"].as_str().map(str::to_owned),
+    })
 }
 
 struct Skill {
@@ -112,41 +175,6 @@ fn parse_tree(bytes: &[u8]) -> Tree {
             })
             .unwrap_or_default()
     };
-    let cond = |v: &Value| -> Cond {
-        let e = || v["e"].as_str().unwrap_or("any").to_owned();
-        match v["k"].as_str() {
-            Some("hand") => Cond::Hand(e()),
-            Some("equip") => Cond::Equip(e()),
-            Some("hp") => Cond::Hp(f(&v["min"]), f(&v["max"])),
-            _ => Cond::None,
-        }
-    };
-    let fx = |v: &Value| -> Option<Fx> {
-        let kind = match v["t"].as_str()? {
-            "attr" => Kind::Attr,
-            "dmg" => Kind::Dmg,
-            "crit" => Kind::Crit,
-            "critdmg" => Kind::CritDmg,
-            "evasion" => Kind::Evasion,
-            "blocking" => Kind::Blocking,
-            "exp_per_minute" => Kind::XpPerMinute,
-            _ => return None,
-        };
-        let dc = match v["dc"].as_str() {
-            Some("melee") => Dc::Melee,
-            Some("projectile") => Dc::Projectile,
-            Some("magic") => Dc::Magic,
-            _ => Dc::Any,
-        };
-        Some(Fx {
-            kind,
-            v: f(&v["v"]),
-            op: v["op"].as_u64().unwrap_or(0) as u8,
-            attr: v["a"].as_str().unwrap_or("").to_owned(),
-            dc,
-            cond: cond(&v["c"]),
-        })
-    };
     let mut skills = Vec::new();
     for s in doc["skills"].as_array().cloned().unwrap_or_default() {
         skills.push(Skill {
@@ -162,7 +190,7 @@ fn parse_tree(bytes: &[u8]) -> Tree {
             one_way: ids(&s["o"]),
             name: [s["ru"][0].as_str().unwrap_or("").to_owned(), s["en"][0].as_str().unwrap_or("").to_owned()],
             lines: [lines(&s["lru"]), lines(&s["len"])],
-            fx: s["fx"].as_array().map(|a| a.iter().filter_map(&fx).collect()).unwrap_or_default(),
+            fx: s["fx"].as_array().map(|a| a.iter().filter_map(parse_fx).collect()).unwrap_or_default(),
         });
     }
     let n = skills.len();
@@ -208,6 +236,35 @@ struct Cfg {
     max_points: u32,
     first_cost: u32,
     last_cost: u32,
+    /// By ore (`diamond`): the chance a gem drops, the lowest and the highest tier (0..5).
+    gems: HashMap<String, (f64, u8, u8)>,
+    /// The chance of a vacucite (it destroys the gems in an item) from emerald and diamond ores.
+    vacucite: f64,
+}
+
+/// The ores that drop gems, cheapest first: chance, lowest tier, highest tier.
+const GEM_ORES: [(&str, f64, u8, u8); 8] = [
+    ("coal", 0.01, 0, 1),
+    ("copper", 0.012, 0, 1),
+    ("iron", 0.02, 0, 2),
+    ("gold", 0.03, 1, 2),
+    ("redstone", 0.03, 1, 3),
+    ("lapis", 0.035, 1, 3),
+    ("emerald", 0.08, 2, 4),
+    ("diamond", 0.1, 2, 5),
+];
+const VACUCITE_CHANCE: f64 = 0.004;
+
+fn gem_cfg_text() -> String {
+    let mut s = String::from(
+        "# Gems from ores (deepslate ores too; none with Silk Touch): gem_<ore> = chance lowest_tier highest_tier\n\
+         # (tiers 0..5: crumbled ... exceptional). gem_vacucite: its chance from emerald and diamond ores.\n",
+    );
+    for (ore, chance, lo, hi) in GEM_ORES {
+        s.push_str(&format!("gem_{ore} = {chance} {lo} {hi}\n"));
+    }
+    s.push_str(&format!("gem_vacucite = {VACUCITE_CHANCE}\n"));
+    s
 }
 
 impl Cfg {
@@ -234,6 +291,10 @@ struct Snap {
     blocking: f64,
     /// (kind, damage condition, value, operation)
     hits: Vec<(Kind, Dc, f64, u8)>,
+    /// Health back on each melee hit.
+    heal: f64,
+    /// (chance, how many more) gems from an ore.
+    gem_loot: Vec<(f64, f64)>,
 }
 
 enum Ask {
@@ -243,6 +304,8 @@ enum Ask {
     Buy(u128),
     Reset(u128),
     Grant(u128, u32),
+    /// What the server sees of a player's gems (a check for tests).
+    Gems(u128),
 }
 
 struct Server {
@@ -253,6 +316,9 @@ struct Server {
     xp_carry: HashMap<u128, f64>,
     ticks: u64,
     dirty: bool,
+    /// Attribute commands that didn't run (shown by `/skilltree gems`).
+    failed_commands: u64,
+    last_failure: String,
 }
 
 static SERVER: Mutex<Option<Server>> = Mutex::new(None);
@@ -270,14 +336,32 @@ max_points = 85\nfirst_cost = 10\nlast_cost = 300\n";
 
 fn load_server() -> Server {
     let path = config_dir().join("kotost_skilltree.txt");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+    let mut text = std::fs::read_to_string(&path).unwrap_or_else(|_| {
         let _ = std::fs::create_dir_all(config_dir());
-        let _ = std::fs::write(&path, DEFAULT_CFG);
-        DEFAULT_CFG.to_owned()
+        let text = format!("{DEFAULT_CFG}{}", gem_cfg_text());
+        let _ = std::fs::write(&path, &text);
+        text
     });
-    let mut cfg = Cfg { max_points: 85, first_cost: 10, last_cost: 300 };
+    // A file from 0.1.0: the gem lines are added, so they can be changed there.
+    if !text.contains("gem_") {
+        text.push_str(&gem_cfg_text());
+        let _ = std::fs::write(&path, &text);
+    }
+    let gems = GEM_ORES.iter().map(|&(ore, c, lo, hi)| (ore.to_owned(), (c, lo, hi))).collect();
+    let mut cfg = Cfg { max_points: 85, first_cost: 10, last_cost: 300, gems, vacucite: VACUCITE_CHANCE };
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else { continue };
+        if let Some(ore) = k.trim().strip_prefix("gem_") {
+            let w: Vec<f64> = v.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            if ore == "vacucite" {
+                cfg.vacucite = w.first().copied().unwrap_or(VACUCITE_CHANCE).clamp(0.0, 1.0);
+            } else if let (Some(&c), Some(e)) = (w.first(), cfg.gems.get_mut(ore)) {
+                let lo = w.get(1).map_or(e.1, |&t| t.clamp(0.0, 5.0) as u8);
+                let hi = w.get(2).map_or(e.2, |&t| t.clamp(0.0, 5.0) as u8).max(lo);
+                *e = (c.clamp(0.0, 1.0), lo, hi);
+            }
+            continue;
+        }
         let Ok(v) = v.trim().parse::<u32>() else { continue };
         match k.trim() {
             "max_points" => cfg.max_points = v.clamp(1, 588),
@@ -298,7 +382,7 @@ fn load_server() -> Server {
         learned.dedup();
         players.insert(uuid, PlayerData { bought: bought.max(learned.len() as u32), learned });
     }
-    Server { cfg, players, applied: HashMap::new(), xp_carry: HashMap::new(), ticks: 0, dirty: false }
+    Server { cfg, players, applied: HashMap::new(), xp_carry: HashMap::new(), ticks: 0, dirty: false, failed_commands: 0, last_failure: String::new() }
 }
 
 fn save(s: &mut Server) {
@@ -366,6 +450,7 @@ pub fn register_commands(commands: &mut Vec<NativeCommand>) {
     commands.push(NativeCommand::new("skilltree"));
     commands.push(NativeCommand::op("skilltree reset", 2));
     commands.push(NativeCommand::op("skilltree points <count:integer>", 2));
+    commands.push(NativeCommand::new("skilltree gems"));
 }
 
 pub fn perform_command(_game: &mut Game<'_>, player: &NativeServerPlayer, command: &str, ran: &mut bool) {
@@ -377,6 +462,7 @@ pub fn perform_command(_game: &mut Game<'_>, player: &NativeServerPlayer, comman
     let ask = match (words.next(), words.next()) {
         (Some("reset"), _) if player.permission >= 2 => Ask::Reset(player.uuid),
         (Some("points"), Some(n)) if player.permission >= 2 => Ask::Grant(player.uuid, n.parse().unwrap_or(1)),
+        (Some("gems"), _) => Ask::Gems(player.uuid),
         _ => Ask::Open(player.uuid),
     };
     lock(&ASKS).push(ask);
@@ -451,18 +537,35 @@ fn holds_cond(game: &Game<'_>, p: &NativeServerPlayer, c: &Cond) -> bool {
             let part = (p.health / 20.0) as f64;
             (*min < 0.0 || part >= *min) && (*max < 0.0 || part <= *max)
         }
+        Cond::Gems(ty, min, max) => {
+            let n = gems_in(game, p.uuid, ty) as f64;
+            (*min < 0.0 || n >= *min) && (*max < 0.0 || n <= *max)
+        }
     }
 }
 
-fn attr_command(game: &mut Game<'_>, name: &str, attr: &str, op: u8, amount: Option<f64>) {
+/// Gives (`Some`) or takes (`None`) one of our attribute modifiers, as the game puts on an item's:
+/// a transient one (not saved with the player; given again after a login or a respawn), replaced in
+/// place. Horizon's `/attribute` can't reach a player from the console of a dedicated server, so the
+/// modifier is set on the player's body directly. Whether the player was reached.
+fn attr_command(game: &mut Game<'_>, p: &NativeServerPlayer, attr: &str, op: u8, amount: Option<f64>, why: &mut String) -> bool {
     let id = format!("kotost_skilltree:{}_{op}", kind_of(attr));
-    match amount {
-        None => {
-            game.native_run_command(&format!("attribute {name} {attr} modifier remove {id}"));
-        }
-        Some(v) => {
-            let op = ["add_value", "add_multiplied_base", "add_multiplied_total"][op.min(2) as usize];
-            game.native_run_command(&format!("attribute {name} {attr} modifier add {id} {v} {op}"));
+    let operation = ["add_value", "add_multiplied_base", "add_multiplied_total"][op.min(2) as usize];
+    let guest = game.lan.as_mut().and_then(|host| host.hub.guests.iter_mut().find(|g| g.uuid == p.uuid));
+    let body = match guest {
+        Some(g) => g.motion.as_deref_mut(),
+        // Single player: the host's own body.
+        None => game.player.as_mut(),
+    };
+    let Some(body) = body else {
+        *why = format!("{}: no body to reach", p.name);
+        return false;
+    };
+    match body.set_modifier(attr, &id, amount.unwrap_or(0.0), operation, amount.is_some()) {
+        Ok(()) => true,
+        Err(e) => {
+            *why = format!("{attr} {id}: {e}");
+            false
         }
     }
 }
@@ -474,29 +577,44 @@ fn refresh(game: &mut Game<'_>, s: &mut Server, players: &[NativeServerPlayer]) 
     let mut by_entity = HashMap::new();
     let minute = s.ticks % 1200 == 0;
     for p in players {
-        let Some(d) = s.players.get(&p.uuid) else {
-            // Nothing learned: only what an earlier session may have left.
-            if let Some(old) = s.applied.remove(&p.uuid) {
-                for ((attr, op), _) in old {
-                    attr_command(game, &p.name, &attr, op, None);
-                }
-            }
-            continue;
-        };
+        // Nothing learned may still mean gems; with neither, what an earlier session left goes.
+        let d = s.players.get(&p.uuid);
         let mut want: HashMap<(String, u8), f64> = HashMap::new();
         let mut snap = Snap::default();
         let mut xp = 0.0;
-        for &i in &d.learned {
-            for fx in &t.skills[i as usize].fx {
-                if !holds_cond(game, p, &fx.cond) {
-                    continue;
+        let mut add = |fx: &Fx, v: f64| match fx.kind {
+            Kind::Attr => *want.entry((fx.attr.clone(), fx.op)).or_default() += v,
+            Kind::Evasion => snap.evasion += v,
+            Kind::Blocking => snap.blocking += v,
+            Kind::XpPerMinute => xp += v,
+            Kind::Heal => snap.heal += v,
+            Kind::GemLoot => snap.gem_loot.push((v, fx.x)),
+            Kind::GemPower | Kind::Sockets => {} // the anvil reads these
+            k => snap.hits.push((k, fx.dc, v, fx.op)),
+        };
+        if let Some(d) = d {
+            for &i in &d.learned {
+                for fx in &t.skills[i as usize].fx {
+                    if !holds_cond(game, p, &fx.cond) {
+                        continue;
+                    }
+                    let v = match &fx.per_gem {
+                        Some(ty) => fx.v * gems_in(game, p.uuid, ty) as f64,
+                        None => fx.v,
+                    };
+                    add(fx, v);
                 }
-                match fx.kind {
-                    Kind::Attr => *want.entry((fx.attr.clone(), fx.op)).or_default() += fx.v,
-                    Kind::Evasion => snap.evasion += fx.v,
-                    Kind::Blocking => snap.blocking += fx.v,
-                    Kind::XpPerMinute => xp += fx.v,
-                    k => snap.hits.push((k, fx.dc, fx.v, fx.op)),
+            }
+        }
+        // The gems in what they wear and hold, each in its own slot.
+        for (slot, stack) in worn(game, p.uuid) {
+            let Some(class) = gem_class(&stack.item) else { continue };
+            if !slot_fits(slot, class) {
+                continue;
+            }
+            for s in read_sockets(&stack).1 {
+                if let Some(fx) = socket_line(&s, class).and_then(|l| l.fx.as_ref()) {
+                    add(fx, fx.v * s.pow as f64);
                 }
             }
         }
@@ -505,23 +623,31 @@ fn refresh(game: &mut Game<'_>, s: &mut Server, players: &[NativeServerPlayer]) 
         }
         let first = !s.applied.contains_key(&p.uuid);
         let have = s.applied.entry(p.uuid).or_default();
+        // Only what the server took is kept as given: a command that didn't run is tried again.
+        let mut given = HashMap::new();
         for (key, v) in &want {
             let old = have.get(key).copied();
             if old.is_some_and(|o| (o - v).abs() < 1e-9) {
+                given.insert(key.clone(), *v);
                 continue;
             }
             // A first sight adds only: a modifier their save kept stays as it is, with their health.
             if !first || old.is_some() {
-                attr_command(game, &p.name, &key.0, key.1, None);
+                attr_command(game, p, &key.0, key.1, None, &mut s.last_failure);
             }
-            attr_command(game, &p.name, &key.0, key.1, Some(*v));
+            if attr_command(game, p, &key.0, key.1, Some(*v), &mut s.last_failure) {
+                given.insert(key.clone(), *v);
+            } else {
+                s.failed_commands += 1;
+            }
         }
         let gone: Vec<_> = have.keys().filter(|k| !want.contains_key(*k)).cloned().collect();
         for key in gone {
-            attr_command(game, &p.name, &key.0, key.1, None);
-            have.remove(&key);
+            if !attr_command(game, p, &key.0, key.1, None, &mut s.last_failure) {
+                given.insert(key.clone(), have[&key]);
+            }
         }
-        *have = want;
+        *have = given;
         if minute && xp > 0.0 {
             let carry = s.xp_carry.entry(p.uuid).or_default();
             *carry += xp;
@@ -541,7 +667,7 @@ fn refresh(game: &mut Game<'_>, s: &mut Server, players: &[NativeServerPlayer]) 
 fn answer(game: &mut Game<'_>, s: &mut Server, players: &[NativeServerPlayer], ask: Ask) {
     let t = tree();
     let uuid = match &ask {
-        Ask::Open(u) | Ask::State(u) | Ask::Buy(u) | Ask::Reset(u) | Ask::Learn(u, _) | Ask::Grant(u, _) => *u,
+        Ask::Open(u) | Ask::State(u) | Ask::Buy(u) | Ask::Reset(u) | Ask::Learn(u, _) | Ask::Grant(u, _) | Ask::Gems(u) => *u,
     };
     let Some(p) = players.iter().find(|p| p.uuid == uuid) else { return };
     let mut open = false;
@@ -584,6 +710,21 @@ fn answer(game: &mut Game<'_>, s: &mut Server, players: &[NativeServerPlayer], a
             }
             let line = if is_ru(game, uuid) { "Древо умений сброшено, очки возвращены." } else { "Your skill tree has been reset." };
             let _ = game.native_tell(uuid, Text::literal(line).with_color(0xFFFF55));
+        }
+        Ask::Gems(_) => {
+            let mut lines = vec![format!("failed attribute commands: {} {}", s.failed_commands, s.last_failure)];
+            for (slot, stack) in worn(game, uuid) {
+                let (cap, list) = read_sockets(&stack);
+                let ids: Vec<String> = list.iter().map(|g| g.id.clone()).collect();
+                lines.push(format!("{slot:?}: {} {:?} sockets {cap:?} [{}]", stack.item, gem_class(&stack.item), ids.join(", ")));
+            }
+            for ((attr, op), v) in s.applied.get(&uuid).into_iter().flatten() {
+                lines.push(format!("given: {attr} op {op} = {v:.4}"));
+            }
+            for line in lines {
+                let _ = game.native_tell(uuid, Text::literal(line).with_color(0xAAAAAA));
+            }
+            return;
         }
         Ask::Grant(_, n) => {
             let d = s.players.entry(uuid).or_default();
@@ -663,9 +804,22 @@ fn boost(snap: &Snap, dc: Dc, amount: &mut f32) {
 /// `native_living_incoming_damage_v2` (server): the acting player's melee hit on a mob.
 pub fn melee_hit(game: &mut Game<'_>, amount: &mut f32) {
     let Some(p) = game.native_acting_player() else { return };
-    let guard = lock(&SNAPS);
-    if let Some(snap) = guard.as_ref().and_then(|(snaps, _)| snaps.get(&p.uuid)) {
-        boost(snap, Dc::Melee, amount);
+    let mut heal = 0.0;
+    {
+        let guard = lock(&SNAPS);
+        if let Some(snap) = guard.as_ref().and_then(|(snaps, _)| snaps.get(&p.uuid)) {
+            boost(snap, Dc::Melee, amount);
+            heal = snap.heal;
+        }
+    }
+    // The acting player's state is in place: their health is the one the hit's player sees.
+    if heal > 0.0 && *amount > 0.0 {
+        if let Some(me) = game.player.as_mut() {
+            let h = me.health.health();
+            if h > 0.0 {
+                let _ = me.set_health(h + heal as f32, false);
+            }
+        }
     }
 }
 
@@ -1090,6 +1244,12 @@ fn client_tick(game: &mut Game<'_>) {
     CLIENT_RU.store(ru, std::sync::atomic::Ordering::Relaxed);
     let (out, close) = {
         let mut guard = lock(&CLIENT);
+        if guard.is_none() && game.native_playing() {
+            // The learned skills, asked once: the anvil's window works out gem power and sockets with them.
+            let mut c = Client::new();
+            c.out.push((CH_ASK, vec![0]));
+            *guard = Some(c);
+        }
         let Some(c) = guard.as_mut() else { return };
         if c.refresh_at.is_some_and(|t| Instant::now() >= t) {
             c.refresh_at = None;
@@ -1119,7 +1279,420 @@ fn client_tick(game: &mut Game<'_>) {
 pub fn tick(game: &mut Game<'_>) {
     if game.native_window() {
         client_tick(game);
-    } else {
+    }
+}
+
+/// `native_server_tick`: the server's work at the end of each tick, where no player's state is
+/// swapped in (commands, such as the attribute modifiers, don't run while one is).
+pub fn server_tick_hook(game: &mut Game<'_>, phase: ServerTickPhase) {
+    if matches!(phase, ServerTickPhase::ServerTickEnd { .. }) && game.lan_acting.is_none() {
         server_tick(game);
+    }
+}
+
+// ---- gems (0.2.0) -----------------------------------------------------------------------------------
+// The gem items are the content mod `kotost_gems` (its own id: there they are data, here the logic).
+// An item's sockets live in its `minecraft:custom_data` under "kotost_gems":
+// {sockets: Int, gems: [{id: "citrine_2", opt: Int (iriscite's rolled bonus, -1), pow: Float}]}.
+
+const GEM_NS: &str = "kotost_gems";
+const GEM_TYPES: [&str; 5] = ["citrine", "iriscite", "jade", "ruby", "sapphire"];
+const CLASS_ORDER: [&str; 7] = ["weapon", "tool", "helmet", "chestplate", "leggings", "boots", "shield"];
+const MAX_SOCKETS: u32 = 3;
+
+struct GemLine {
+    text: [String; 2],
+    fx: Option<Fx>,
+}
+
+struct Gem {
+    id: String,
+    tier: u8,
+    color: u32,
+    name: [String; 2],
+    by_class: HashMap<String, GemLine>,
+    /// Iriscite: one of these, rolled when it goes in.
+    random: Vec<GemLine>,
+    /// Vacucite: it empties the item's sockets.
+    removal: bool,
+}
+
+struct Gems {
+    list: Vec<Gem>,
+    classes: HashMap<String, [String; 2]>,
+    ui: HashMap<String, [String; 2]>,
+}
+
+fn gems() -> &'static Gems {
+    static GEMS: OnceLock<Gems> = OnceLock::new();
+    GEMS.get_or_init(|| {
+        use serde_json::Value;
+        let doc: Value =
+            serde_json::from_slice(crate::native_data!("kotost_skilltree", "gems.json")).unwrap_or(Value::Null);
+        let s = |v: &Value| v.as_str().unwrap_or("").to_owned();
+        let pair = |v: &Value| [s(&v[0]), s(&v[1])];
+        let line = |v: &Value| GemLine { text: [s(&v["ru"]), s(&v["en"])], fx: parse_fx(&v["fx"]) };
+        let pairs = |v: &Value| -> HashMap<String, [String; 2]> {
+            v.as_object().map(|o| o.iter().map(|(k, v)| (k.clone(), pair(v))).collect()).unwrap_or_default()
+        };
+        let list = doc["gems"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|g| Gem {
+                        id: s(&g["id"]),
+                        tier: g["t"].as_u64().unwrap_or(0) as u8,
+                        color: g["col"].as_u64().unwrap_or(0xFFFFFF) as u32,
+                        name: [s(&g["ru"]), s(&g["en"])],
+                        by_class: g["cls"]
+                            .as_object()
+                            .map(|o| o.iter().map(|(k, v)| (k.clone(), line(v))).collect())
+                            .unwrap_or_default(),
+                        random: g["rnd"].as_array().map(|a| a.iter().map(&line).collect()).unwrap_or_default(),
+                        removal: g["rm"].as_u64() == Some(1),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Gems { list, classes: pairs(&doc["classes"]), ui: pairs(&doc["ui"]) }
+    })
+}
+
+fn gem(id: &str) -> Option<&'static Gem> {
+    gems().list.iter().find(|g| g.id == id)
+}
+
+/// The gem an item id (`kotost_gems:ruby_3`) is.
+fn gem_of(item: &str) -> Option<&'static Gem> {
+    gem(item.strip_prefix(GEM_NS)?.strip_prefix(':')?)
+}
+
+/// Which of a gem's bonuses an item with sockets takes; None for an item without sockets.
+fn gem_class(item: &str) -> Option<&'static str> {
+    let i = kind_of(item);
+    Some(if is_type(item, "helmet") {
+        "helmet"
+    } else if is_type(item, "chestplate") {
+        "chestplate"
+    } else if is_type(item, "leggings") {
+        "leggings"
+    } else if is_type(item, "boots") {
+        "boots"
+    } else if i == "shield" {
+        "shield"
+    } else if is_type(item, "pickaxe") || is_type(item, "shovel") {
+        "tool"
+    } else if is_type(item, "sword") || is_type(item, "axe") || matches!(i, "bow" | "crossbow" | "trident" | "mace") {
+        "weapon"
+    } else {
+        return None;
+    })
+}
+
+/// An item's own sockets, by its material: 1 to 3 (the tree's "more sockets" adds, up to 3).
+fn base_sockets(item: &str) -> u32 {
+    let i = kind_of(item);
+    if i.starts_with("diamond_") || i.starts_with("netherite_") || matches!(i, "trident" | "mace") {
+        3
+    } else if i.starts_with("iron_") || i.starts_with("copper_") || matches!(i, "bow" | "crossbow" | "shield") {
+        2
+    } else {
+        1
+    }
+}
+
+/// Whether an item of `class` gives its gems from `slot`: weapons and tools in the main hand, armour worn.
+fn slot_fits(slot: EquipmentSlot, class: &str) -> bool {
+    use EquipmentSlot as S;
+    match slot {
+        S::MainHand => matches!(class, "weapon" | "tool" | "shield"),
+        S::OffHand => class == "shield",
+        S::Head => class == "helmet",
+        S::Chest => class == "chestplate",
+        S::Legs => class == "leggings",
+        S::Feet => class == "boots",
+        _ => false,
+    }
+}
+
+fn worn(game: &Game<'_>, uuid: u128) -> Vec<(EquipmentSlot, ItemStack)> {
+    use EquipmentSlot as S;
+    [S::MainHand, S::OffHand, S::Head, S::Chest, S::Legs, S::Feet]
+        .into_iter()
+        .filter_map(|slot| game.native_player_equipment(uuid, slot).filter(|s| s.count > 0).map(|s| (slot, s)))
+        .collect()
+}
+
+/// The gems in a player's worn and held items of type `ty` (the tree's "if you have gems in ...").
+fn gems_in(game: &Game<'_>, uuid: u128, ty: &str) -> usize {
+    worn(game, uuid)
+        .iter()
+        .filter(|(slot, s)| is_type(&s.item, ty) && gem_class(&s.item).is_some_and(|c| slot_fits(*slot, c)))
+        .map(|(_, s)| read_sockets(s).1.len())
+        .sum()
+}
+
+#[derive(Clone)]
+struct Socketed {
+    id: String,
+    opt: i32,
+    pow: f32,
+}
+
+use horizon_world::nbt::{Compound, JavaString, Tag};
+
+fn tag_num(t: &Tag) -> Option<f64> {
+    Some(match t {
+        Tag::Byte(v) => *v as f64,
+        Tag::Short(v) => *v as f64,
+        Tag::Int(v) => *v as f64,
+        Tag::Long(v) => *v as f64,
+        Tag::Float(b) => f32::from_bits(*b) as f64,
+        Tag::Double(b) => f64::from_bits(*b),
+        _ => return None,
+    })
+}
+
+/// The sockets an item was given (None: none yet, its material's count then) and the gems in them.
+fn read_sockets(stack: &ItemStack) -> (Option<u32>, Vec<Socketed>) {
+    let key = |k: &str| JavaString::from(k);
+    let Some(Tag::Compound(c)) = stack.custom_data().and_then(|d| d.get(&key(GEM_NS))) else {
+        return (None, Vec::new());
+    };
+    let cap = c.get(&key("sockets")).and_then(tag_num).map(|n| n.clamp(0.0, 9.0) as u32);
+    let mut list = Vec::new();
+    if let Some(Tag::List(items)) = c.get(&key("gems")) {
+        for t in items {
+            let Tag::Compound(g) = t else { continue };
+            let Some(Tag::String(id)) = g.get(&key("id")) else { continue };
+            list.push(Socketed {
+                id: id.to_string_lossy(),
+                opt: g.get(&key("opt")).and_then(tag_num).unwrap_or(-1.0) as i32,
+                pow: g.get(&key("pow")).and_then(tag_num).unwrap_or(1.0) as f32,
+            });
+        }
+    }
+    (cap, list)
+}
+
+fn write_sockets(stack: &mut ItemStack, cap: u32, list: &[Socketed]) {
+    let key = |k: &str| JavaString::from(k);
+    let mut data: Compound = stack.custom_data().cloned().unwrap_or_default();
+    let gems = list
+        .iter()
+        .map(|s| {
+            Tag::Compound(Compound::from([
+                (key("id"), Tag::String(key(&s.id))),
+                (key("opt"), Tag::Int(s.opt)),
+                (key("pow"), Tag::Float(s.pow.to_bits())),
+            ]))
+        })
+        .collect();
+    data.insert(
+        key(GEM_NS),
+        Tag::Compound(Compound::from([(key("sockets"), Tag::Int(cap as i32)), (key("gems"), Tag::List(gems))])),
+    );
+    stack.data_mut().set_other("minecraft:custom_data", Some(Tag::Compound(data)));
+}
+
+/// The bonus a socketed gem gives an item of `class`.
+fn socket_line(s: &Socketed, class: &str) -> Option<&'static GemLine> {
+    let g = gem(&s.id)?;
+    if g.random.is_empty() {
+        g.by_class.get(class)
+    } else {
+        g.random.get(s.opt.max(0) as usize)
+    }
+}
+
+/// A player's learned skills: the server's record where this is the server (or single player), else the client's.
+fn learned_of(uuid: u128) -> Vec<u16> {
+    if let Some(d) = lock(&SERVER).as_ref().and_then(|s| s.players.get(&uuid)) {
+        return d.learned.clone();
+    }
+    lock(&CLIENT)
+        .as_ref()
+        .map(|c| c.learned.iter().enumerate().filter(|(_, l)| **l).map(|(i, _)| i as u16).collect())
+        .unwrap_or_default()
+}
+
+/// The tree's gem power (an added share) and extra sockets for an item.
+fn gem_skills(uuid: u128, item: &str) -> (f64, u32) {
+    let t = tree();
+    let (mut power, mut sockets) = (0.0, 0.0);
+    for i in learned_of(uuid) {
+        let Some(s) = t.skills.get(i as usize) else { continue };
+        for fx in &s.fx {
+            let fits = fx.e == "any" || is_type(item, &fx.e);
+            match fx.kind {
+                Kind::GemPower if fits => power += fx.v,
+                Kind::Sockets if fits => sockets += fx.v,
+                _ => {}
+            }
+        }
+    }
+    (power, sockets.max(0.0) as u32)
+}
+
+fn mix(parts: &[&[u8]]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for p in parts {
+        for &b in *p {
+            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    h
+}
+
+/// `native_anvil_update` (the server's menu and the window's alike): an item with sockets on the
+/// left, a gem on the right. The result has the gem in its next free socket (a vacucite empties
+/// them), for 1 to 3 levels and one gem. Asked again for the same inputs, it answers the same.
+pub fn anvil_update(
+    player: u128,
+    left: &ItemStack,
+    right: Option<&ItemStack>,
+    output: &mut Option<ItemStack>,
+    xp_cost: &mut i32,
+    material_cost: &mut i32,
+) {
+    let Some(g) = right.and_then(|r| gem_of(&r.item)) else { return };
+    let mut result = None;
+    if gem_class(&left.item).is_some() && left.count == 1 {
+        let (cap, mut list) = read_sockets(left);
+        let (power, extra) = gem_skills(player, &left.item);
+        let cap = cap.unwrap_or(0).max((base_sockets(&left.item) + extra).min(MAX_SOCKETS));
+        let changed = if g.removal {
+            let any = !list.is_empty();
+            list.clear();
+            any
+        } else if (list.len() as u32) < cap {
+            let mut opt = -1;
+            if !g.random.is_empty() {
+                // Iriscite: one of its bonuses the server runs, the same each time it is asked.
+                let usable: Vec<usize> =
+                    g.random.iter().enumerate().filter(|(_, l)| l.fx.is_some()).map(|(i, _)| i).collect();
+                let (who, n, dmg) = (player.to_le_bytes(), (list.len() as u32).to_le_bytes(), left.damage.to_le_bytes());
+                let h = mix(&[left.item.as_bytes(), who.as_slice(), n.as_slice(), dmg.as_slice(), g.id.as_bytes()]);
+                opt = usable.get((h % usable.len().max(1) as u64) as usize).copied().unwrap_or(0) as i32;
+            }
+            list.push(Socketed { id: g.id.clone(), opt, pow: (1.0 + power) as f32 });
+            true
+        } else {
+            false
+        };
+        if changed {
+            let mut out = left.clone();
+            write_sockets(&mut out, cap, &list);
+            result = Some(out);
+        }
+    }
+    match result {
+        Some(out) => {
+            *output = Some(out);
+            *xp_cost = 1 + g.tier as i32 / 2;
+            *material_cost = 1;
+        }
+        None => {
+            *output = None;
+            *xp_cost = 0;
+            *material_cost = 0;
+        }
+    }
+}
+
+/// `native_loot_drops` (server): now and then a gem from an ore a player broke, never with Silk Touch.
+/// The dearer the ore, the likelier and the better (config: `gem_<ore>`).
+pub fn loot_drops(context: &NativeLootDrops<'_>, drops: &mut Vec<ItemStack>) {
+    if context.block.is_none() {
+        return;
+    }
+    let Some(uuid) = context.player else { return };
+    let Some(block) = context.table.strip_prefix("minecraft:blocks/") else { return };
+    let Some(ore) = block.trim_start_matches("deepslate_").trim_start_matches("nether_").strip_suffix("_ore") else {
+        return;
+    };
+    if context.tool.is_some_and(|t| t.enchantment_level("minecraft:silk_touch") > 0)
+        || drops.iter().any(|d| d.item.ends_with("_ore"))
+    {
+        return;
+    }
+    let (chance, lo, hi, vacucite) = {
+        let guard = lock(&SERVER);
+        let Some(s) = guard.as_ref() else { return };
+        let Some(&(c, lo, hi)) = s.cfg.gems.get(ore) else { return };
+        (c, lo, hi, s.cfg.vacucite)
+    };
+    let mut found = Vec::new();
+    if rand01() < chance {
+        // Each tier up is half as likely as the one below.
+        let weights: Vec<f64> = (lo..=hi).map(|t| 0.5f64.powi((t - lo) as i32)).collect();
+        let mut r = rand01() * weights.iter().sum::<f64>();
+        let mut tier = hi;
+        for (k, w) in weights.iter().enumerate() {
+            if r < *w {
+                tier = lo + k as u8;
+                break;
+            }
+            r -= w;
+        }
+        let kind = GEM_TYPES[((rand01() * GEM_TYPES.len() as f64) as usize).min(GEM_TYPES.len() - 1)];
+        found.push(format!("{GEM_NS}:{kind}_{tier}"));
+    }
+    if matches!(ore, "emerald" | "diamond") && rand01() < vacucite {
+        found.push(format!("{GEM_NS}:vacucite_3"));
+    }
+    if found.is_empty() {
+        return;
+    }
+    let more: Vec<(f64, f64)> =
+        lock(&SNAPS).as_ref().and_then(|(s, _)| s.get(&uuid)).map(|s| s.gem_loot.clone()).unwrap_or_default();
+    for id in found {
+        let mut count = 1;
+        for &(c, x) in &more {
+            if rand01() < c {
+                count += x.round().max(0.0) as u32;
+            }
+        }
+        drops.push(ItemStack { item: id.as_str().into(), count, damage: 0, extra: None });
+    }
+}
+
+/// `native_tooltip` (client): a gem's bonus for each kind of item; an item's sockets and its gems.
+/// Grey: a bonus this version doesn't run yet.
+pub fn item_tooltip(game: &Game<'_>, stack: &ItemStack, lines: &mut Vec<(Text, u32)>) {
+    const GRAY: u32 = 0xAAAAAA;
+    const DARK: u32 = 0x666666;
+    let l = if game.settings.language.to_lowercase().starts_with("ru") { 0 } else { 1 };
+    let d = gems();
+    let ui = |k: &str| d.ui.get(k).map(|p| p[l].clone()).unwrap_or_default();
+    let mut add = |s: String, color: u32| lines.push((Text::literal(s.as_str()).with_color(color), u32::MAX));
+    if let Some(g) = gem_of(&stack.item) {
+        add(ui("info"), GRAY);
+        if g.removal {
+            add(format!("• {}", ui("removal")), g.color);
+        } else if !g.random.is_empty() {
+            add(format!("• {}", ui("random")), g.color);
+        } else {
+            for class in CLASS_ORDER {
+                let (Some(line), Some(name)) = (g.by_class.get(class), d.classes.get(class)) else { continue };
+                add(format!("• {}: {}", name[l], line.text[l]), if line.fx.is_some() { g.color } else { DARK });
+            }
+        }
+        return;
+    }
+    let Some(class) = gem_class(&stack.item) else { return };
+    let (cap, list) = read_sockets(stack);
+    let cap = cap.unwrap_or(0).max(base_sockets(&stack.item)).max(list.len() as u32);
+    add(format!("{} {}/{}:", ui("sockets"), list.len(), cap), GRAY);
+    for s in &list {
+        let Some(g) = gem(&s.id) else { continue };
+        let line = socket_line(s, class);
+        let text = line.map(|x| x.text[l].clone()).unwrap_or_default();
+        let boost = if s.pow > 1.001 { format!(" (+{}%)", ((s.pow - 1.0) * 100.0).round()) } else { String::new() };
+        let color = if line.is_some_and(|x| x.fx.is_some()) { g.color } else { DARK };
+        add(format!(" ◆ {}: {}{}", g.name[l], text, boost), color);
+    }
+    for _ in list.len() as u32..cap {
+        add(format!(" ◇ {}", ui("socket")), DARK);
     }
 }

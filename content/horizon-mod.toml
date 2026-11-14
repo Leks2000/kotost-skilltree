@@ -1,0 +1,8 @@
+id = "kotost_gems"
+name = "Kotost Gems"
+version = "0.2.0"
+description = "Gems for Kotost Skill Tree: citrine, iriscite, jade, ruby, sapphire (6 tiers) and vacucite, as items. Drops, sockets and bonuses are the native mod kotost_skilltree's. Textures and names: Passive Skill Tree by Daripher (GPL-3.0)."
+authors = ["Kotost Games"]
+api = "0.2"
+side = "both"
+capabilities = ["registries"]

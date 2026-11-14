@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bakes Passive Skill Tree's own data files (skills, lang, textures) into kotost_skilltree/data.
 
-    python -I bake.py <PassiveSkillTree jar> <out data dir>
+    python -I bake.py <PassiveSkillTree jar> <out data dir> [<content mod dir: kotost_gems>]
 
 Reads only the jar's data and assets (JSON, PNG), never its code. Writes:
   atlas.png  1024x1024: icons (16px grid), the five button frames, the background.
@@ -20,6 +20,8 @@ VAN_ATTR = {
     "attack_damage": ("Урон", "Attack Damage"), "attack_speed": ("Скорость атаки", "Attack Speed"),
     "luck": ("Удача", "Luck"), "max_health": ("Максимальное здоровье", "Max Health"),
     "movement_speed": ("Скорость", "Speed"),
+    "knockback_resistance": ("Сопротивление отбрасыванию", "Knockback Resistance"),
+    "mining_efficiency": ("Эффективность добычи", "Mining Efficiency"),
 }
 EFFECTS = {"minecraft:poison": ("Отравление", "Poison")}
 EXTRA = {"curios:ring": ("Слоты колец", "Ring Slots")}
@@ -231,17 +233,54 @@ def cond(c):
         return False
     if t == "health_percentage":
         return {"k": "hp", "min": c.get("min", -1), "max": c.get("max", -1)}
+    if t == "has_gems":
+        e = equip_type(c.get("item_condition"))
+        return {"k": "gems", "e": e, "min": c.get("min", -1), "max": c.get("max", -1)} if e else False
     return False
+
+def equip_type(ic):
+    """An item condition the server checks as an equipment type, else None (jewelry tags: no curios here)."""
+    if ic and ic.get("type") == "skilltree:equipment_type":
+        return ic["equipment_type"]
+    return None
 
 def effect(b):
     """The simplified effect, or None when this version doesn't run it (the line shows grey)."""
     t = b["type"].split(":")[1]
-    if not none(b.get("player_multiplier")) or not none(b.get("enemy_multiplier")):
+    m = None  # "for each gem in <type>": the server multiplies the value by that gem count
+    pm = b.get("player_multiplier")
+    if not none(pm):
+        m = equip_type(pm.get("item_condition")) if pm["type"] == "skilltree:gems_amount" else None
+        if m is None:
+            return None
+    e = plain_effect(t, b)
+    if e is not None and m:
+        e["m"] = m
+    return e
+
+def plain_effect(t, b):
+    if not none(b.get("enemy_multiplier")):
         return None
     if not none(b.get("target_condition")):
         return None
     c = cond(b.get("player_condition"))
     if c is False:
+        return None
+    if t == "gem_power":
+        e = equip_type(b.get("item_condition"))
+        return {"t": "gempower", "v": b["multiplier"], "e": e} if e else None
+    if t == "player_sockets":
+        e = equip_type(b.get("item_condition"))
+        return {"t": "sockets", "v": b["sockets"], "e": e} if e else None
+    if t == "loot_duplication":
+        if b["loot_type"] == "gems":
+            return {"t": "gemloot", "v": b["chance"], "x": b["multiplier"], "c": c}
+        return None
+    if t == "healing":
+        e = b["event_listener"]
+        quiet = all(none(e.get(k)) for k in ("damage_condition", "enemy_condition", "enemy_multiplier", "player_condition", "player_multiplier"))
+        if e["type"] == "skilltree:attack" and e.get("target", "player") == "player" and quiet and b.get("chance", 1) >= 1:
+            return {"t": "heal", "v": b["amount"], "c": c}
         return None
     if t == "attribute":
         a = b["attribute"]
@@ -249,6 +288,9 @@ def effect(b):
             return {"t": "attr", "a": "minecraft:" + a.split(":")[1].replace("generic.", ""), "v": b["amount"], "op": b["operation"], "c": c}
         if a in ("skilltree:evasion", "skilltree:blocking", "skilltree:exp_per_minute") and b["operation"] == 0:
             return {"t": a.split(":")[1], "v": b["amount"], "c": c}
+        # A gem's evasion and blocking are a share (operation 1); the server keeps them in percent.
+        if a in ("skilltree:evasion", "skilltree:blocking") and b["operation"] == 1:
+            return {"t": a.split(":")[1], "v": b["amount"] * 100, "c": c}
         return None
     if t == "damage":
         return {"t": "dmg", "v": b["amount"], "op": b["operation"], "dc": dmg_key(b), "c": c}
@@ -325,5 +367,108 @@ doc = {"frames": [frames[n] for n in FRAMES], "bg": [0, 200, 512, 512], "skills"
 with open(out + "/tree.json", "w", encoding="utf-8") as fh:
     json.dump(doc, fh, ensure_ascii=False, separators=(",", ":"))
 print("skills", len(skills), "icons", len(icons), "bonuses", total, "run by the server", run)
+
+# ---- gems (0.2.0) ---------------------------------------------------------------------------------
+# data/gems.json: each gem's bonus by item class, ru/en lines and the effect the server runs.
+# With a third argument, also the content mod kotost_gems: the gem items, models, textures, names.
+import os, shutil
+CONTENT = "kotost_gems"
+GEM_KINDS = ["citrine", "iriscite", "jade", "ruby", "sapphire", "vacucite"]
+GEM_COLORS = {"citrine": 0xFFD24A, "iriscite": 0xE6A8FF, "jade": 0x5CD98F, "ruby": 0xFF5A64,
+              "sapphire": 0x6E9BFF, "vacucite": 0x8FC9B5}
+CLASSES = [("weapon", "Оружие", "Weapon"), ("tool", "Инструмент", "Tool"), ("helmet", "Шлем", "Helmet"),
+           ("chestplate", "Нагрудник", "Chestplate"), ("leggings", "Поножи", "Leggings"),
+           ("boots", "Ботинки", "Boots"), ("shield", "Щит", "Shield")]
+STEP = [1, 2, 3, 4, 5, 10]  # the original's tiers: 1..5, then x2
+NONE = {"type": "skilltree:none"}
+
+def tool_bonus(kind, tier, by_class):
+    """Tools (pickaxes, shovels) have no gem class in the original: ours, on the same steps."""
+    v = STEP[tier]
+    if kind == "jade":
+        return {"type": "skilltree:skill_bonus", "skill_bonus": {
+            "type": "skilltree:block_break_speed", "multiplier": 0.02 * v, "player_condition": NONE}}
+    if kind == "sapphire":
+        return {"type": "skilltree:skill_bonus", "skill_bonus": {
+            "type": "skilltree:attribute", "attribute": "minecraft:generic.mining_efficiency", "amount": float(v),
+            "operation": 0, "player_condition": NONE, "player_multiplier": NONE}}
+    return by_class["helmet"]  # citrine: more gems from ore; ruby: health
+
+def gem_line(ib):
+    fx = effect(ib["skill_bonus"]) if ib["type"] == "skilltree:skill_bonus" else None
+    d = {"fx": fx}
+    for lang in ("ru", "en"):
+        d[lang] = " ".join(item_bonus(lang, ib).split())
+    return d
+
+gems = []
+for kind in GEM_KINDS:
+    for tier in range(6):
+        p = "data/skilltree/gem_types/%s_%d.json" % (kind, tier)
+        if p not in z.namelist():
+            continue
+        short = "%s_%d" % (kind, tier)
+        e = {"id": short, "k": kind, "t": tier, "col": GEM_COLORS[kind],
+             "ru": L("ru", "item.skilltree.gem.skilltree." + short), "en": L("en", "item.skilltree.gem.skilltree." + short)}
+        by_class = {}
+        for b in jload(p)["bonuses"]:
+            bp = b["bonus_provider"]
+            bt = bp["type"].split(":")[1]
+            if bt == "gem_removal":
+                e["rm"] = 1
+            elif bt == "random":
+                e["rnd"] = [gem_line(o["bonus_provider"]["item_bonus"]) for o in bp["bonuses"]
+                            if o["bonus_provider"]["type"] == "skilltree:simple"]
+            elif bt == "simple":
+                c = equip_type(b["item_condition"])
+                if c:
+                    by_class[c] = bp["item_bonus"]
+        if by_class:
+            by_class["leggings"] = by_class["chestplate"]
+            by_class["tool"] = tool_bonus(kind, tier, by_class)
+            e["cls"] = {c: gem_line(by_class[c]) for c, _, _ in CLASSES}
+        gems.append(e)
+ui = {
+    "socket": [L("ru", "gem.socket"), L("en", "gem.socket")],
+    "random": [L("ru", "gem_bonus.random"), L("en", "gem_bonus.random")],
+    "removal": [L("ru", "gem_bonus.removal"), L("en", "gem_bonus.removal")],
+    "info": ["Вставляется на наковальне в предмет с гнёздами", "Put it into an item with sockets on an anvil"],
+    "sockets": ["Гнёзда", "Sockets"],
+}
+with open(out + "/gems.json", "w", encoding="utf-8") as fh:
+    json.dump({"gems": gems, "classes": {c: [r, n] for c, r, n in CLASSES}, "ui": ui}, fh, ensure_ascii=False, separators=(",", ":"))
+gem_lines = sum(len(g.get("cls", {})) + len(g.get("rnd", [])) for g in gems)
+gem_run = sum(1 for g in gems for l in list(g.get("cls", {}).values()) + g.get("rnd", []) if l["fx"])
+print("gems", len(gems), "lines", gem_lines, "run by the server", gem_run)
+
+if len(sys.argv) > 3:
+    cdir = sys.argv[3]
+    ns = CONTENT
+    def put(rel, obj):
+        path = os.path.join(cdir, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, ensure_ascii=False, indent=2)
+    rarity = ["common", "common", "uncommon", "uncommon", "rare", "epic"]
+    lang = {"ru": {}, "en": {}}
+    for g in gems:
+        i = g["id"]
+        put("assets/%s/items/%s.json" % (ns, i), {"model": {"type": "minecraft:model", "model": "%s:item/%s" % (ns, i)}})
+        put("assets/%s/models/item/%s.json" % (ns, i), {"parent": "minecraft:item/generated", "textures": {"layer0": "%s:item/%s" % (ns, i)}})
+        png = os.path.join(cdir, "assets/%s/textures/item/%s.png" % (ns, i))
+        os.makedirs(os.path.dirname(png), exist_ok=True)
+        with open(png, "wb") as fh:
+            fh.write(z.read("assets/skilltree/textures/item/gems/%s.png" % i))
+        put("data/%s/horizon/item/%s.json" % (ns, i), {"template": "minecraft:amethyst_shard", "rarity": rarity[g["t"]]})
+        lang["ru"]["item.%s.%s" % (ns, i)] = g["ru"]
+        lang["en"]["item.%s.%s" % (ns, i)] = g["en"]
+    lang["ru"]["itemGroup.%s.gems" % ns] = "Kotost: самоцветы"
+    lang["en"]["itemGroup.%s.gems" % ns] = "Kotost: Gems"
+    put("assets/%s/lang/ru_ru.json" % ns, lang["ru"])
+    put("assets/%s/lang/en_us.json" % ns, lang["en"])
+    put("data/%s/horizon/creative_tab/gems.json" % ns, {
+        "title": "itemGroup.%s.gems" % ns, "icon": "%s:ruby_5" % ns, "items": ["%s:%s" % (ns, g["id"]) for g in gems]})
+    print("content", ns, len(gems), "items ->", cdir)
+
 if missing:
     print("MISSING", sorted(missing)[:40])

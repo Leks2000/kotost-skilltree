@@ -1,29 +1,31 @@
 # Kotost Skill Tree: submit form
 Kind: Native mod
-File: kotost_skilltree-0.1.0.hnmod
+File: kotost_skilltree-0.2.0.hnmod
 Id: kotost_skilltree
-Version: 0.1.0
+Version: 0.2.0
 Name: Kotost Skill Tree
 Licence: GPL-3.0-or-later
 Authors: Kotost Games
 Source code: https://github.com/Leks2000/kotost-skilltree
-Categories: Game mechanics, Interface
+Categories: Game mechanics
 Tags: skills, skill tree, rpg, progression, experience
 For Minecraft: 26.3
 Icon: icon.png
-Screenshots: screenshot*.png
+Screenshots: screenshot1.png, screenshot2.png, screenshot3.png
 
 ## What changed
-First release.
+Gems and sockets: ores drop gems (citrine, iriscite, jade, ruby, sapphire in six tiers, and vacucite), items get 1-3 sockets, gems go in on the anvil and give their bonuses; tree skills about gems now work, healing on hit too. Tree attribute bonuses now reach players on a dedicated server. Gem items: the content mod kotost_gems.
 
 ## Summary
-A big passive skill tree: buy points with experience and learn 588 skills on a starry map. A port of Passive Skill Tree by Daripher.
+A big passive skill tree with gems and sockets: buy points with experience, learn 588 skills, socket gems from ores into your gear. A port of Passive Skill Tree by Daripher.
 
 ## Description
 Press **O** (or `/skilltree`) to open the tree: 588 skills on one starry map, linked into branches for warriors, archers, miners, cooks, mages and travellers, with big keystones. The button at the bottom buys a skill point for experience (every next point costs more); take up to three of the six starting skills, then click a skill that touches one you already have to learn it. Mouse wheel zooms, drag moves, hover a skill to read its bonuses.
 
-Working bonuses in 0.1.0: attributes (armor, health, attack speed, damage, speed, luck, toughness), melee, projectile and magic damage, critical chance and damage, evasion, shield blocking, mining speed, jump height, experience per minute, and the "holding / wearing" and "health percent" conditions (238 of the tree's 649 bonuses). The others are shown grey in the tooltips and do nothing yet.
+Working bonuses: attributes (armor, health, attack speed, damage, speed, luck, toughness), melee, projectile and magic damage, critical chance and damage, evasion, shield blocking, mining speed, jump height, experience per minute, the "holding / wearing" and "health percent" conditions, gems, sockets and healing on hit (291 of the tree's 649 bonuses). The others are shown grey in the tooltips and do nothing yet.
 
-The server keeps the points and learned skills per player (`config/kotost_skilltree_players.txt`); points and costs are set in `config/kotost_skilltree.txt`. Operators: `/skilltree points <n>`, `/skilltree reset`. Needed on the server and the client. Russian and English, by the game's language.
+The server keeps the points and learned skills per player (`config/kotost_skilltree_players.txt`); points and costs are set in `config/kotost_skilltree.txt`. Operators: `/skilltree points <n>`, `/skilltree reset`.
+
+**Gems (0.2.0).** Mining ores sometimes gives a gem: citrine, iriscite, jade, ruby or sapphire in six tiers, and a rare vacucite; the more valuable the ore, the better the chance and the tier (`gem_<ore>` lines in the config), nothing with Silk Touch. Tools, weapons, shields and armour have 1-3 sockets by material; put the item and a gem into an anvil to socket it. A vacucite empties the sockets. The bonus depends on the gem and the item and works while it is held or worn; tooltips show sockets and bonuses, `/skilltree gems` lists yours. The gem items are the content mod **Kotost Gems** (`kotost_gems`): install it too. Needed on the server and the client. Russian and English, by the game's language.
 
 A port of Passive Skill Tree 0.6.14a by Daripher (GPL-3.0): the tree, its texts and pictures are the original's data files, baked by `tools/bake.py` in the source repository; the code is written anew for Horizon. No Minecraft code or assets are included. Native source mod: the launcher compiles it after a warning; it runs with your account's permissions.
